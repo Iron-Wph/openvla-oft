@@ -118,15 +118,21 @@ class RLDSDataset(IterableDataset):
         else:
             load_camera_views = ("primary", "wrist")
 
-        per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
-            self.data_root_dir,
-            mixture_spec,
-            load_camera_views=load_camera_views,
-            load_depth=False,
-            load_proprio=True,
-            load_language=True,
-            action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
-        )
+        if self.data_mix == "rbench_all":
+            from prismatic.vla.datasets.rlds.rbench import dataset_kwargs
+
+            per_dataset_kwargs, weights = dataset_kwargs(data_root_dir, train)
+            mixture_spec = per_dataset_kwargs
+        else:
+            per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
+                self.data_root_dir,
+                mixture_spec,
+                load_camera_views=load_camera_views,
+                load_depth=False,
+                load_proprio=True,
+                load_language=True,
+                action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
+            )
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step
@@ -141,7 +147,7 @@ class RLDSDataset(IterableDataset):
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
             sample_weights=weights,
-            balance_weights=True,
+            balance_weights=self.data_mix != "rbench_all",
             traj_transform_threads=len(mixture_spec),
             traj_read_threads=len(mixture_spec),
             train=train,
@@ -167,6 +173,11 @@ class RLDSDataset(IterableDataset):
 
         # Initialize RLDS Dataset
         self.dataset, self.dataset_length, self.dataset_statistics = self.make_dataset(rlds_config)
+        if self.data_mix == "rbench_all":
+            shared = per_dataset_kwargs[0]["dataset_statistics"].copy()
+            for key in ("num_transitions", "num_trajectories"):
+                shared[key] = sum(kwargs["dataset_statistics"][key] for kwargs in per_dataset_kwargs)
+            self.dataset_statistics = {"rbench_all": shared}
 
     def make_dataset(self, rlds_config):
         return make_interleaved_dataset(**rlds_config)

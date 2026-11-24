@@ -5,6 +5,7 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+import json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -97,6 +98,7 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
+    training_checkpoint: Optional[Path] = None  # RBench full training state; base model remains vla_path.
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
@@ -582,6 +584,7 @@ def save_training_checkpoint(
     action_head,
     train_dataset,
     distributed_state,
+    resume_data=None,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -609,6 +612,11 @@ def save_training_checkpoint(
         checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
         checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
 
+    final_dir = checkpoint_dir
+    if resume_data is not None:
+        if final_dir.exists():
+            raise FileExistsError(final_dir)
+        checkpoint_dir = final_dir.with_name(f".{final_dir.name}.{os.getpid()}.partial")
     adapter_dir = checkpoint_dir / "lora_adapter"
 
     # Create directories and save dataset statistics (main process only)
@@ -662,6 +670,14 @@ def save_training_checkpoint(
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
+        dist.barrier()
+
+    if resume_data is not None:
+        from prismatic.vla.rbench_checkpoint import save_state
+        save_state(checkpoint_dir, log_step, *resume_data)
+        if distributed_state.is_main_process:
+            (checkpoint_dir / "COMPLETE.json").write_text(json.dumps({"completed":log_step}))
+            checkpoint_dir.rename(final_dir)
         dist.barrier()
 
 
@@ -944,6 +960,25 @@ def finetune(cfg: FinetuneConfig) -> None:
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
 
+    rbench = cfg.dataset_name == "rbench_all"
+    completed = 0
+    resume_data = None
+    if rbench:
+        from prismatic.vla.rbench_checkpoint import parameters, signature, restore, reopen_curve, curve_record
+        if cfg.resume or cfg.save_latest_checkpoint_only or cfg.merge_lora_during_training:
+            raise ValueError("RBench continuation uses training_checkpoint and separately retained checkpoints")
+        trainable = parameters([("vla",vla),("action_head",action_head if cfg.use_l1_regression or cfg.use_diffusion else None),
+                                ("noise",noisy_action_projector if cfg.use_diffusion else None),
+                                ("proprio",proprio_projector if cfg.use_proprio else None)])
+        assert list(map(id,trainable.values())) == list(map(id,trainable_params))
+        identity = signature(cfg)
+        resume_data = (trainable, optimizer, scheduler, identity)
+        if cfg.training_checkpoint:
+            completed = restore(cfg.training_checkpoint, *resume_data, run_dir)
+            if completed >= cfg.max_steps:
+                raise ValueError("The checkpoint has already reached the requested total")
+            reopen_curve(run_dir, completed)
+
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
@@ -1029,7 +1064,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     }
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(total=cfg.max_steps, initial=completed, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1069,9 +1104,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
+            if rbench:
+                gradient_step_idx += completed
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+            if not rbench and distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
@@ -1081,7 +1118,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
 
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+            if not rbench and distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
@@ -1093,13 +1130,23 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                update_lr = optimizer.param_groups[0]["lr"]
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
 
+            if rbench:
+                if (batch_idx + 1) % cfg.grad_accumulation_steps:
+                    continue
+                log_step = gradient_step_idx + 1
+                if log_step == 1 or log_step % cfg.wandb_log_freq == 0:
+                    global_metrics = curve_record(run_dir, log_step, smoothened_metrics, update_lr, device_id)
+                    if distributed_state.is_main_process:
+                        log_metrics_to_wandb(global_metrics, "VLA Train", log_step, wandb)
+                        wandb.log({"VLA Train/Learning Rate":update_lr},step=log_step)
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if (rbench or gradient_step_idx > 0) and log_step % cfg.save_freq == 0:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1111,6 +1158,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
+                    resume_data=resume_data,
                 )
 
             # Test model on validation set

@@ -1,0 +1,24 @@
+# OFT LIBERO-Long recipe, with RBench inputs and 16-rank DDP.
+dataset_name: rbench_all
+batch_size: 4
+grad_accumulation_steps: 1
+max_steps: 150000
+learning_rate: 0.0005
+lr_warmup_steps: 0
+num_steps_before_decay: 100000
+
+use_lora: true
+lora_rank: 32
+lora_dropout: 0.0
+use_l1_regression: true
+use_diffusion: false
+use_film: true
+num_images_in_input: 2
+use_proprio: true
+image_aug: true
+
+save_freq: 10000
+save_latest_checkpoint_only: false
+merge_lora_during_training: false
+use_val_set: false
+wandb_project: rbench-openvla-oft

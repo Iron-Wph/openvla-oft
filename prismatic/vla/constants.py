@@ -4,6 +4,7 @@ Important constants for VLA training and evaluation.
 Attempts to automatically identify the correct constants to set based on the Python command used to launch
 training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
 """
+import os
 import sys
 from enum import Enum
 
@@ -30,6 +31,8 @@ LIBERO_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+RBENCH_CONSTANTS = dict(LIBERO_CONSTANTS, ACTION_DIM=8, ACTION_PROPRIO_NORMALIZATION_TYPE=NormalizationType.BOUNDS)
+
 ALOHA_CONSTANTS = {
     "NUM_ACTIONS_CHUNK": 25,
     "ACTION_DIM": 14,
@@ -49,6 +52,10 @@ BRIDGE_CONSTANTS = {
 def detect_robot_platform():
     cmd_args = " ".join(sys.argv).lower()
 
+    if os.environ.get("OPENVLA_ROBOT_PLATFORM") == "RBENCH" or any(
+        arg in ("rbench_all", "--dataset_name=rbench_all") for arg in sys.argv
+    ):
+        return "RBENCH"
     if "libero" in cmd_args:
         return "LIBERO"
     elif "aloha" in cmd_args:
@@ -66,6 +73,8 @@ ROBOT_PLATFORM = detect_robot_platform()
 # Set the appropriate constants based on the detected platform
 if ROBOT_PLATFORM == "LIBERO":
     constants = LIBERO_CONSTANTS
+elif ROBOT_PLATFORM == "RBENCH":
+    constants = RBENCH_CONSTANTS
 elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS
 elif ROBOT_PLATFORM == "BRIDGE":

@@ -51,6 +51,7 @@ def make_dataset_from_rlds(
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
+    episode_shards: Optional[Dict[str, List[str]]] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -199,7 +200,12 @@ def make_dataset_from_rlds(
 
         return traj
 
-    builder = tfds.builder(name, data_dir=data_dir)
+    if episode_shards is None:
+        builder = tfds.builder(name, data_dir=data_dir)
+    else:
+        from prismatic.vla.datasets.rlds.rbench import SegmentedEpisodeReader
+
+        builder = SegmentedEpisodeReader(data_dir, name, episode_shards)
 
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):
@@ -542,7 +548,7 @@ def make_interleaved_dataset(
             else {}
         )
         dataset, _ = make_dataset_from_rlds(
-            **dataset_kwargs,
+            **{key: value for key, value in dataset_kwargs.items() if key != "dataset_statistics"},
             train=train,
             num_parallel_calls=threads,
             num_parallel_reads=reads,
