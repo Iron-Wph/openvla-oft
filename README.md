@@ -33,6 +33,76 @@ action chunks. Each action has seven absolute Panda joint targets in radians and
 one gripper opening target in meters. The loaders use the same `BOUNDS`
 normalization statistics from the training split.
 
+### Prepare training data
+
+Use the OpenVLA-OFT environment with `pyarrow`, `h5py`, `google-crc32c`
+and Pillow installed. The input is the LeRobot v2.1 task tree and the original
+HDF5 tree. The converter copies the two camera streams and action-bearing
+steps from LeRobot, and reads the terminal observation from the matching HDF5.
+For TRACK-CLEAR-01, use an HDF5 root that combines the original and archived
+episodes under their original relative paths.
+
+1. **Convert by task.** The two archived converters are
+   [standard (RLDS 1.1.0)](scripts/rbench_data/standard/convert_rbench_rlds.py)
+   and [segmented (RLDS 1.2.0)](scripts/rbench_data/segmented/convert_rbench_rlds.py).
+   Both write one TFRecord shard per episode. The segmented version uses
+   multiple records within a shard to keep large episodes below the single-record
+   size limit. In the 33-task run, the segmented tasks were BOOK-EXTRACT-01,
+   CARTON-SHIP-01, L-DISTILL-01, LID-PROP-01, R-ELECTRORECOVERY-01, R-FOAM-01,
+   R-IRON-OXYGEN-01, TRACK-CLEAR-01, W-U02 and W-U15. The other 23 used standard
+   format. The full split reserves the last two complete episodes per scene for
+   validation. Assign each task to just one worker machine. The batch entry
+   points are the `run_rbench_rlds_batch.py` files next to the two converters.
+
+   ```bash
+   # Set LEROBOT_ROOT, HDF5_ROOT, RLDS_ROOT and LOG_ROOT to your dataset paths.
+   mkdir -p "$RLDS_ROOT" "$LOG_ROOT"
+   python scripts/rbench_data/standard/run_rbench_rlds_batch.py \
+     "$LEROBOT_ROOT" "$HDF5_ROOT" "$RLDS_ROOT" "$LOG_ROOT/C-TR-01" --tasks C-TR-01
+   python scripts/rbench_data/segmented/run_rbench_rlds_batch.py \
+     "$LEROBOT_ROOT" "$HDF5_ROOT" "$RLDS_ROOT" "$LOG_ROOT/TRACK-CLEAR-01" --tasks TRACK-CLEAR-01
+   ```
+
+2. **Compute the shared statistics after all tasks are published.**
+   [`compute_norm_stats.py`](scripts/rbench_data/compute_norm_stats.py) uses
+   the conversion job's `statistics()` function. It reads only the LeRobot
+   `actions` and `state` columns for training episodes, then computes one
+   frame-weighted set of statistics for the entire mixture. The manifest and
+   statistics are linked by a digest. The formal split contained 3,762 training
+   episodes and 198 validation episodes.
+
+   ```bash
+   python scripts/rbench_data/compute_norm_stats.py "$LEROBOT_ROOT" "$RLDS_ROOT"
+   ```
+
+   To reproduce statistics from a frozen split without replacing existing
+   files, pass `--manifest /path/to/manifest.json --output /path/to/review-dir`.
+
+3. **Compress the training images.** The archived
+   [JPEG encoder](scripts/rbench_data/reencode_rbench_jpeg.py) resizes both
+   RGB views to 256×256 with bicubic interpolation and writes JPEG quality 95.
+   The [in-place driver](scripts/rbench_data/inplace.py) verifies each shard
+   before replacement, updates TFDS metadata and keeps receipts. Use a separate
+   work directory and keep training stopped until finalization. This operation
+   replaces the original PNG shards in the specified RLDS directory. The
+   LeRobot input, action/state fields, split and existing `norm_stats.json`
+   are preserved.
+
+   ```bash
+   # Prepare once. Then run the middle command once for each task.
+   python scripts/rbench_data/inplace.py "$RLDS_ROOT" "$JPEG_WORK" prepare
+   python scripts/rbench_data/inplace.py "$RLDS_ROOT" "$JPEG_WORK" C-TR-01 --workers 8
+   # Run once after every task has finished.
+   python scripts/rbench_data/inplace.py "$RLDS_ROOT" "$JPEG_WORK" finalize
+   ```
+
+   If you have a previously verified JPEG staging tree with matching receipts,
+   pass `--reuse /path/to/staging` to `prepare`. The staging files are moved
+   into the dataset and must be on the same filesystem.
+
+4. **Train.** Point `OFT_DATA_ROOT` at the finalized JPEG RLDS directory and
+   use the launcher below.
+
 ### Launch on two nodes
 
 Set up [the OpenVLA-OFT environment](SETUP.md) on both nodes. Both nodes need
